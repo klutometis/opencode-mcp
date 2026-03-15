@@ -13,8 +13,6 @@ export interface RegistrationFile {
   localPort: number
   /** Working directory of the opencode instance */
   cwd: string
-  /** PID of the SSH tunnel process (on the relay side) */
-  pid?: number
   /** ISO timestamp of when the tunnel was established */
   connectedAt: string
 }

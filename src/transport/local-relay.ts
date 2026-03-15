@@ -1,32 +1,24 @@
 import { readdir, readFile, unlink } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Transport } from './interface.js'
 import type { OpenCodeInstance, RegistrationFile } from '../types.js'
 
-const DEFAULT_REGISTRY_DIR = join(
-  homedir(),
-  '.local',
-  'share',
-  'opencode-relay',
-)
+const DEFAULT_REGISTRY_DIR = '/tmp/opencode-relay'
 const DEFAULT_HEALTH_TIMEOUT_MS = 3000
 
 /**
  * Local relay transport: reads registration JSON files written by
- * opencode-connect.sh via SSH reverse tunnels, health-checks each
+ * opencode-connected via SSH reverse tunnels, health-checks each
  * registered port on localhost, prunes stale entries.
  */
 export class LocalRelayTransport implements Transport {
   readonly name = 'local-relay'
   private registryDir: string
   private healthTimeoutMs: number
-  private password: string | undefined
 
   constructor(options?: {
     registryDir?: string
     healthTimeoutMs?: number
-    password?: string
   }) {
     this.registryDir =
       options?.registryDir ??
@@ -36,8 +28,6 @@ export class LocalRelayTransport implements Transport {
       options?.healthTimeoutMs ??
       (Number(process.env.HEALTH_CHECK_TIMEOUT_MS) ||
         DEFAULT_HEALTH_TIMEOUT_MS)
-    this.password =
-      options?.password ?? process.env.OPENCODE_SERVER_PASSWORD
   }
 
   async discover(): Promise<OpenCodeInstance[]> {
@@ -105,7 +95,6 @@ export class LocalRelayTransport implements Transport {
         tunnelPort: reg.port,
         localPort: reg.localPort,
         connectedAt: reg.connectedAt,
-        pid: reg.pid,
       },
     }
   }
@@ -120,19 +109,8 @@ export class LocalRelayTransport implements Transport {
         this.healthTimeoutMs,
       )
 
-      const headers: Record<string, string> = {}
-      if (this.password) {
-        const username =
-          process.env.OPENCODE_SERVER_USERNAME ?? 'opencode'
-        const encoded = Buffer.from(
-          `${username}:${this.password}`,
-        ).toString('base64')
-        headers['Authorization'] = `Basic ${encoded}`
-      }
-
       const res = await fetch(`${baseUrl}/global/health`, {
         signal: controller.signal,
-        headers,
       })
       clearTimeout(timeout)
 

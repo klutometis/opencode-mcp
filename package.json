@@ -1,13 +1,35 @@
 {
   "name": "opencode-mcp",
   "version": "1.0.0",
+  "description": "MCP server for orchestrating OpenCode instances across machines via SSH reverse tunnels",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "opencode-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/klutometis/opencode-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "opencode",
+    "ai",
+    "coding-assistant",
+    "remote",
+    "ssh"
+  ],
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@opencode-ai/sdk": "^1.2.26",

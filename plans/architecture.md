@@ -97,7 +97,6 @@ START=$(( BASE + $(echo "$NAME" | cksum | cut -d' ' -f1) % RANGE ))
   "port": 10042,
   "localPort": 4096,
   "cwd": "/home/user/projects/myproject",
-  "pid": 12345,
   "connectedAt": "2026-03-14T10:30:00Z"
 }
 ```
@@ -105,18 +104,20 @@ START=$(( BASE + $(echo "$NAME" | cksum | cut -d' ' -f1) % RANGE ))
 ### Authentication
 
 - **MCP layer**: OAuth via mcp-gateway (already handled)
-- **OpenCode instances**: `OPENCODE_SERVER_PASSWORD` as HTTP Basic auth,
-  injected by the SDK client in the registry
-- **SSH tunnels**: standard SSH key auth to the relay machine
-- **Tunnel ports**: bound to localhost only, not externally accessible
+- **OpenCode binding**: `127.0.0.1` (default) — not network-accessible.
+  No HTTP password needed; the SSH tunnel is the auth boundary.
+- **SSH tunnels**: standard SSH key auth or gcloud auth to the relay machine
+- **Tunnel ports**: bound to host's localhost only, not externally accessible
+- **Optional**: `OPENCODE_SERVER_PASSWORD` can be added back if opencode
+  binds to `0.0.0.0` (e.g. for LAN/phone access without tunnels)
 
 ### Stale Instance Pruning
 
 On each `discover()` call, the transport:
 1. Reads all JSON files from the registry directory
-2. For each, attempts `GET http://localhost:{port}/` with a 3-second timeout
+2. For each, probes `GET http://localhost:{port}/global/health`
 3. If unreachable, deletes the registration file
-4. Returns only healthy instances
+4. Returns only healthy instances (with version from health endpoint)
 
 ## Repository Structure
 
@@ -132,15 +133,13 @@ opencode-mcp/
 │   ├── registry.ts              # Instance cache + OpenCode SDK client mgmt
 │   ├── transport/
 │   │   ├── interface.ts         # Abstract transport interface
-│   │   ├── local-relay.ts       # Reads JSON files, health-checks, localhost URLs
-│   │   └── tailscale.ts         # (future) Tailscale API discovery
+│   │   └── local-relay.ts       # Reads JSON files, health-checks, localhost URLs
 │   └── tools/
 │       ├── instances.ts         # list_instances, refresh_instances
 │       ├── sessions.ts          # list_sessions, get_session, create_session
 │       └── messages.ts          # send_message, get_status, abort_session
 ├── scripts/
-│   ├── opencode-connect.sh      # Client: start opencode + tunnel + register
-│   └── setup-relay.sh           # One-time GCE setup
+│   └── opencode-connected       # Client: random port + tunnel + exec opencode TUI
 └── PROPOSAL.md                  # Original proposal (includes Tailscale plan)
 ```
 
@@ -228,17 +227,18 @@ Self-contained script (symlink to `~/bin/opencode-connected`) that:
 6. **EXIT trap** kills tunnel_loop, which cleans up registration on relay
 
 Env vars:
-- `RELAY_HOST` — required (skip tunnel if unset for offline use)
-- `RELAY_USER` — defaults to `$(whoami)`
+- `RELAY_SSH_CMD` — SSH command to reach relay (e.g. `gcloud compute ssh ...`).
+  If unset, local only — no tunnel, just local registration.
 - `INSTANCE_NAME` — defaults to `$(hostname)-$(basename $PWD)`
-- `RELAY_REGISTRY_DIR` — defaults to `/var/lib/opencode-relay`
-- `OPENCODE_SERVER_PASSWORD` — optional
+- `RELAY_REGISTRY_DIR` — defaults to `/tmp/opencode-relay`
 
 Config selection (e.g. work machine MCPs) is handled extrinsically via
 `OPENCODE_CONFIG` env var in the user's shell profile — not by this script.
 
 Note: `opencode` without `--port` does NOT start an HTTP server.
 The `--port` flag is what enables the HTTP side-car alongside the TUI.
+OpenCode binds to `127.0.0.1` by default — no password needed when
+using SSH tunnels as the auth boundary.
 
 ### Phase 9: Relay Setup
 No dedicated setup script needed. The `opencode-connected` script lazily
@@ -346,27 +346,26 @@ to maintain persistent SSE connections per instance.
 
 ## Environment Variables
 
-```bash
-# Registry directory (where tunnel registration JSON files live)
-# Default: ~/.local/share/opencode-relay
-# RELAY_REGISTRY_DIR=/var/lib/opencode-relay
+### MCP server
 
-# Shared password for opencode instances (HTTP Basic auth)
-OPENCODE_SERVER_PASSWORD=your-shared-secret
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_REGISTRY_DIR` | `/tmp/opencode-relay` | Registry directory |
+| `DISCOVERY_INTERVAL_MS` | `30000` | Refresh interval (ms) |
+| `HEALTH_CHECK_TIMEOUT_MS` | `3000` | Health check timeout (ms) |
+| `TRANSPORT` | `local-relay` | Transport backend |
 
-# Username for HTTP Basic auth (default: opencode)
-# OPENCODE_SERVER_USERNAME=opencode
+### `opencode-connected` script
 
-# Discovery refresh interval (ms)
-DISCOVERY_INTERVAL_MS=30000
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_SSH_CMD` | — | SSH command to reach relay. If unset, local only. |
+| `RELAY_REGISTRY_DIR` | `/tmp/opencode-relay` | Registry directory |
+| `INSTANCE_NAME` | `$(hostname)-$(basename $PWD)` | Instance name |
 
-# Health check timeout per instance (ms)
-HEALTH_CHECK_TIMEOUT_MS=3000
+### Optional (only if binding to 0.0.0.0)
 
-# Transport backend: "local-relay" | "tailscale" (future)
-TRANSPORT=local-relay
-
-# --- Tailscale (future) ---
-# TS_API_KEY=tskey-api-xxx
-# TS_TAILNET=-
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENCODE_SERVER_PASSWORD` | — | HTTP Basic auth password |
+| `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP Basic auth username |

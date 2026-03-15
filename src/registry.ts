@@ -45,25 +45,8 @@ export class InstanceRegistry {
   }
 
   private makeClient(inst: OpenCodeInstance): OpencodeClient {
-    const password = process.env.OPENCODE_SERVER_PASSWORD
-    const baseUrl = this.transport.getBaseUrl(inst)
-
-    const customFetch = password
-      ? (request: Request) => {
-          const username =
-            process.env.OPENCODE_SERVER_USERNAME ?? 'opencode'
-          const encoded = Buffer.from(
-            `${username}:${password}`,
-          ).toString('base64')
-          const headers = new Headers(request.headers)
-          headers.set('Authorization', `Basic ${encoded}`)
-          return fetch(new Request(request, { headers }))
-        }
-      : undefined
-
     return createOpencodeClient({
-      baseUrl,
-      ...(customFetch ? { fetch: customFetch } : {}),
+      baseUrl: this.transport.getBaseUrl(inst),
     })
   }
 
@@ -97,7 +80,7 @@ export class InstanceRegistry {
       if (available.length === 0) {
         throw new Error(
           'No opencode instances are currently connected. ' +
-            'Run opencode-connect.sh on a machine to register one.',
+            'Run opencode-connected on a machine to register one.',
         )
       }
       throw new Error(

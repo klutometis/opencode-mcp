@@ -11,37 +11,31 @@ backends (Tailscale, Cloudflare Tunnels, mDNS).
 # 1. Install
 npm install && npm run build
 
-# 2. Create a registration file pointing at a running opencode instance
-mkdir -p /tmp/opencode-relay-test
-cat > /tmp/opencode-relay-test/local-test.json << 'EOF'
-{
-  "name": "local-test",
-  "hostname": "localhost",
-  "port": 4096,
-  "localPort": 4096,
-  "cwd": "/home/you/your-project",
-  "connectedAt": "2026-01-01T00:00:00Z"
-}
-EOF
+# 2. Start opencode with HTTP side-car (in a separate terminal)
+#    opencode-connected picks a random port and writes a registration file
+ln -s ~/prg/opencode-mcp/scripts/opencode-connected ~/bin/opencode-connected
+opencode-connected
 
-# 3. Run with MCP inspector
-RELAY_REGISTRY_DIR=/tmp/opencode-relay-test \
-  npx @modelcontextprotocol/inspector tsx src/index.ts
+# 3. Run with MCP inspector (in another terminal)
+npx @modelcontextprotocol/inspector tsx src/index.ts
 
 # Or run directly (stdio MCP server)
-RELAY_REGISTRY_DIR=/tmp/opencode-relay-test node dist/index.js
+node dist/index.js
 ```
+
+Both `opencode-connected` and the MCP server default to `/tmp/opencode-relay`
+for the registry directory — no configuration needed for local testing.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────┐
-│        Relay machine (e.g. GCE instance)     │
+│        Relay machine (GCE / VPS / etc.)      │
 │                                              │
 │  mcp-gateway ──── opencode-mcp (stdio)       │
 │       │              │                       │
-│       │         reads /var/lib/              │
-│       │         opencode-relay/*.json         │
+│       │         reads /tmp/opencode-relay/    │
+│       │         or RELAY_REGISTRY_DIR         │
 │       │              │                       │
 │    OAuth         localhost:10001 ──┐         │
 │    front         localhost:10002 ──┤ opencode│
@@ -53,13 +47,16 @@ RELAY_REGISTRY_DIR=/tmp/opencode-relay-test node dist/index.js
     ssh -R     ssh -R      ssh -R
        │          │           │
     laptop     desktop     laptop
-    (oc:4096)  (oc:4096)   (oc:4097)
+    (oc:4823)  (oc:4567)   (oc:4901)
 ```
 
 The MCP server runs on the same machine that accepts SSH reverse tunnels.
 It reads registration JSON files from a directory, health-checks each
 registered port on localhost, and creates OpenCode SDK clients for healthy
 instances. All OpenCode API calls go through `localhost:{tunnel_port}`.
+
+OpenCode binds to `127.0.0.1` (default) — the SSH tunnel is the auth
+boundary. No passwords needed.
 
 ## MCP Tools
 
@@ -79,14 +76,22 @@ Instance names support fuzzy substring matching (e.g. `"laptop"` matches
 
 ## Environment Variables
 
+### MCP server
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RELAY_REGISTRY_DIR` | `~/.local/share/opencode-relay` | Directory containing registration JSON files |
-| `OPENCODE_SERVER_PASSWORD` | — | HTTP Basic auth password for opencode instances |
-| `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP Basic auth username |
+| `RELAY_REGISTRY_DIR` | `/tmp/opencode-relay` | Directory containing registration JSON files |
 | `DISCOVERY_INTERVAL_MS` | `30000` | How often to refresh instance list (ms) |
 | `HEALTH_CHECK_TIMEOUT_MS` | `3000` | Timeout for health-checking each instance (ms) |
 | `TRANSPORT` | `local-relay` | Transport backend (`local-relay`, future: `tailscale`) |
+
+### `opencode-connected` script
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_SSH_CMD` | — | SSH command to reach relay. If unset, local only. |
+| `RELAY_REGISTRY_DIR` | `/tmp/opencode-relay` | Registry directory (local or on relay) |
+| `INSTANCE_NAME` | `$(hostname)-$(basename $PWD)` | Instance name for registration |
 
 ## Registration File Format
 
@@ -97,134 +102,87 @@ Each file in `RELAY_REGISTRY_DIR` is a JSON file named `{instance-name}.json`:
   "name": "laptop-myproject",
   "hostname": "laptop",
   "port": 10042,
-  "localPort": 4096,
+  "localPort": 4823,
   "cwd": "/home/user/projects/myproject",
-  "pid": 12345,
   "connectedAt": "2026-03-14T10:30:00Z"
 }
 ```
 
-Files are written by `opencode-connected` on the client machine via SSH.
+Files are written by `opencode-connected` (locally or on the relay via SSH).
 The MCP server prunes files whose ports fail health checks.
 
 ## Connecting an OpenCode Instance
 
 Use `opencode-connected` instead of bare `opencode` to start the TUI with
-an HTTP side-car and an SSH tunnel to the relay:
+an HTTP side-car:
 
 ```bash
 # Install (symlink)
 ln -s ~/prg/opencode-mcp/scripts/opencode-connected ~/bin/opencode-connected
 
-# Start opencode with tunnel to relay
-RELAY_HOST=my-relay.example.com opencode-connected
+# Local only (no tunnel, writes registration to /tmp/opencode-relay/)
+opencode-connected
 
-# Start without tunnel (local HTTP server only)
+# With relay (set RELAY_SSH_CMD in your shell profile)
+export RELAY_SSH_CMD="gcloud compute ssh mcp-gateway --zone=us-central1-a --project=my-project --"
+opencode-connected
+
+# Or with direct SSH
+export RELAY_SSH_CMD="ssh user@relay.example.com"
 opencode-connected
 
 # Pass extra args to opencode (after --)
-RELAY_HOST=my-relay.example.com opencode-connected -- -d
+opencode-connected -- -d
 ```
 
 The script:
 1. Picks a random available local port (4096-5095)
-2. Starts opencode TUI with `--port` and `--hostname 0.0.0.0` (enables HTTP side-car)
-3. Establishes an SSH reverse tunnel to the relay in the background (with auto-retry)
-4. Registers the instance on the relay (lazily creates the registry directory)
+2. Starts opencode TUI with `--port` (enables HTTP side-car on `127.0.0.1`)
+3. If `RELAY_SSH_CMD` is set: establishes SSH reverse tunnel with auto-retry
+4. Registers the instance (lazily creates the registry directory)
 5. Cleans up the registration file on exit
 
 Note: `opencode` without `--port` does **not** start an HTTP server.
 The `--port` flag is what enables the HTTP side-car alongside the TUI.
 
-### Environment variables for `opencode-connected`
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RELAY_HOST` | — | Relay hostname (skip tunnel if unset) |
-| `RELAY_USER` | `$(whoami)` | SSH user on relay |
-| `INSTANCE_NAME` | `$(hostname)-$(basename $PWD)` | Instance name for registration |
-| `RELAY_REGISTRY_DIR` | `/var/lib/opencode-relay` | Registry dir on relay |
-| `OPENCODE_SERVER_PASSWORD` | — | Password for opencode HTTP auth |
-
 For work machines with different MCP configs, set `OPENCODE_CONFIG` in your
 shell profile — the script does not handle config selection.
-
-## Relay Machine Setup
-
-No dedicated setup step needed. The `opencode-connected` script lazily
-creates the registry directory on the relay when registering. The relay
-machine just needs `sshd` running (default on most Linux boxes) and
-Node.js 20+ for the MCP server.
 
 ## Integration with mcp-gateway (Docker)
 
 To add opencode-mcp to an existing mcp-gateway Docker deployment:
 
-### 1. Host-side setup
+### 1. Install from npm
 
-Run `scripts/setup-relay.sh` on the **Docker host** (not inside the container).
-SSH tunnels connect to the host's sshd and bind ports on the host's localhost.
-
-### 2. Docker Compose additions
-
-```yaml
-services:
-  mcp-gateway:
-    # ... existing config ...
-
-    # Required: access SSH tunnel ports bound on host's localhost
-    network_mode: host
-
-    # Mount the registration directory (read-only is fine for the MCP server)
-    volumes:
-      - /var/lib/opencode-relay:/var/lib/opencode-relay:ro
-
-    environment:
-      # ... existing env vars ...
-      RELAY_REGISTRY_DIR: /var/lib/opencode-relay
-      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
-      # OPENCODE_SERVER_USERNAME: opencode  # only if overridden
+```bash
+npx -y opencode-mcp  # or add to gateway's SERVERS dict
 ```
 
-`network_mode: host` is required because SSH reverse tunnels bind on the
-**host's** `localhost`, not the container's. Without it, the MCP server
-can't reach `localhost:10001` etc.
+### 2. Docker configuration
 
-If `network_mode: host` is too broad, forward the tunnel port range instead:
 ```yaml
-    ports:
-      - "10000-10099:10000-10099"
+# docker run additions:
+--network=host                    # reach SSH tunnel ports on host's localhost
+-v /tmp/opencode-relay:/tmp/opencode-relay:ro  # read registration files
+-e RELAY_REGISTRY_DIR=/tmp/opencode-relay
 ```
+
+`--network=host` is required because SSH reverse tunnels bind on the
+**host's** `localhost`. The container needs to reach those ports directly.
 
 ### 3. MCP server config in mcp-gateway
 
-Add to the mcp-gateway's MCP server configuration:
+Add to the gateway's server configuration:
 
-```json
-{
-  "mcpServers": {
-    "opencode": {
-      "command": "node",
-      "args": ["/path/to/opencode-mcp/dist/index.js"],
-      "env": {
-        "RELAY_REGISTRY_DIR": "/var/lib/opencode-relay",
-        "OPENCODE_SERVER_PASSWORD": "your-shared-secret"
-      }
-    }
-  }
-}
-```
-
-Or if using tsx for development:
 ```json
 {
   "mcpServers": {
     "opencode": {
       "command": "npx",
-      "args": ["tsx", "/path/to/opencode-mcp/src/index.ts"],
+      "args": ["-y", "opencode-mcp"],
+      "transport": "stdio",
       "env": {
-        "RELAY_REGISTRY_DIR": "/var/lib/opencode-relay",
-        "OPENCODE_SERVER_PASSWORD": "your-shared-secret"
+        "RELAY_REGISTRY_DIR": "/tmp/opencode-relay"
       }
     }
   }
@@ -234,8 +192,9 @@ Or if using tsx for development:
 ### 4. Verify
 
 ```bash
-# On a client machine, connect an opencode instance:
-RELAY_HOST=my-relay.example.com opencode-connected
+# On a client machine:
+export RELAY_SSH_CMD="gcloud compute ssh mcp-gateway --zone=us-central1-a --project=my-project --"
+opencode-connected
 
 # From the chat interface, the LLM can now call:
 # list_instances → sees the connected instance
@@ -278,8 +237,8 @@ npm start            # run compiled output
 
 ## Security
 
-- **SSH tunnels**: standard SSH key auth to the relay machine
-- **Tunnel ports**: bound to localhost only, not externally accessible
-- **OpenCode auth**: HTTP Basic auth via `OPENCODE_SERVER_PASSWORD`
+- **SSH tunnels**: the auth boundary — standard SSH key or gcloud auth
+- **Tunnel ports**: bound to host's localhost only, not externally accessible
+- **OpenCode binding**: `127.0.0.1` by default — not network-accessible
 - **MCP transport**: stdio (no network exposure); OAuth via mcp-gateway
 - **Registration files**: contain only name, hostname, port, cwd — no credentials

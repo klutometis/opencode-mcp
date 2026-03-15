@@ -6,9 +6,13 @@ set -euo pipefail
 # to a relay machine for remote access via opencode-mcp.
 #
 # Usage:
-#   opencode-connected                     # TUI + server + tunnel
-#   RELAY_HOST="" opencode-connected       # TUI + server, no tunnel
+#   opencode-connected                     # TUI + server, local only
 #   opencode-connected -- -d               # pass -d (debug) to opencode
+#
+# With relay (set in shell profile or .env):
+#   export RELAY_SSH_CMD="gcloud compute ssh mcp-gateway --zone=us-central1-a --project=my-project --"
+#   export RELAY_SSH_CMD="ssh user@relay.example.com"
+#   opencode-connected
 #
 # Symlink:
 #   ln -s ~/prg/opencode-mcp/scripts/opencode-connected ~/bin/opencode-connected
@@ -18,11 +22,9 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────
 
 # ── Config ───────────────────────────────────────────────────────
-RELAY_HOST="${RELAY_HOST:-}"
-RELAY_USER="${RELAY_USER:-$(whoami)}"
+RELAY_SSH_CMD="${RELAY_SSH_CMD:-}"
 INSTANCE_NAME="${INSTANCE_NAME:-$(hostname)-$(basename "$PWD")}"
-REGISTRY_DIR="${RELAY_REGISTRY_DIR:-${HOME}/.local/share/opencode-relay}"
-OPENCODE_SERVER_PASSWORD="${OPENCODE_SERVER_PASSWORD:-}"
+REGISTRY_DIR="${RELAY_REGISTRY_DIR:-/tmp/opencode-relay}"
 
 # Port ranges
 LOCAL_PORT_MIN=4096
@@ -57,47 +59,7 @@ compute_remote_port() {
   echo $(( REMOTE_PORT_BASE + hash % REMOTE_PORT_RANGE ))
 }
 
-# ── Tunnel management (runs in background) ───────────────────────
-tunnel_loop() {
-  local local_port="$1"
-  local remote_port_start
-  remote_port_start=$(compute_remote_port "$INSTANCE_NAME")
-  local reg_file="${REGISTRY_DIR}/${INSTANCE_NAME}.json"
-  local current_remote_port="$remote_port_start"
-
-  # Clean up registration on exit
-  trap 'cleanup_registration "$reg_file"; exit 0' TERM EXIT
-
-  while true; do
-    # Register on relay (lazily creates directory)
-    register_instance "$current_remote_port" "$local_port" "$reg_file"
-
-    # Try to establish tunnel
-    ssh -N \
-      -o ConnectTimeout=10 \
-      -o ServerAliveInterval=30 \
-      -o ServerAliveCountMax=3 \
-      -o ExitOnForwardFailure=yes \
-      -R "${current_remote_port}:localhost:${local_port}" \
-      "${RELAY_USER}@${RELAY_HOST}" 2>/dev/null
-
-    local exit_code=$?
-
-    # Check if parent (opencode) is still alive
-    if ! kill -0 "$PPID" 2>/dev/null; then
-      break
-    fi
-
-    if (( exit_code == 255 )); then
-      # SSH error — could be port conflict or connection failure
-      # Try next port
-      current_remote_port=$(( REMOTE_PORT_BASE + (current_remote_port - REMOTE_PORT_BASE + 1) % REMOTE_PORT_RANGE ))
-    fi
-
-    sleep 5
-  done
-}
-
+# ── Registration helpers ─────────────────────────────────────────
 make_reg_json() {
   local port="$1"
   local local_port="$2"
@@ -123,9 +85,8 @@ register_instance() {
   local reg_json
   reg_json=$(make_reg_json "$port" "$local_port")
 
-  if [ -n "$RELAY_HOST" ]; then
-    ssh -o ConnectTimeout=10 "${RELAY_USER}@${RELAY_HOST}" \
-      "mkdir -p '${REGISTRY_DIR}' && cat > '${reg_file}'" <<< "$reg_json" 2>/dev/null || true
+  if [ -n "$RELAY_SSH_CMD" ]; then
+    ${RELAY_SSH_CMD} "mkdir -p '${REGISTRY_DIR}' && cat > '${reg_file}'" <<< "$reg_json" 2>/dev/null || true
   else
     mkdir -p "$REGISTRY_DIR"
     echo "$reg_json" > "$reg_file"
@@ -134,12 +95,51 @@ register_instance() {
 
 cleanup_registration() {
   local reg_file="$1"
-  if [ -n "$RELAY_HOST" ]; then
-    ssh -o ConnectTimeout=5 "${RELAY_USER}@${RELAY_HOST}" \
-      "rm -f '${reg_file}'" 2>/dev/null || true
+  if [ -n "$RELAY_SSH_CMD" ]; then
+    ${RELAY_SSH_CMD} "rm -f '${reg_file}'" 2>/dev/null || true
   else
     rm -f "$reg_file" 2>/dev/null || true
   fi
+}
+
+# ── Tunnel management (runs in background) ───────────────────────
+tunnel_loop() {
+  local local_port="$1"
+  local remote_port_start
+  remote_port_start=$(compute_remote_port "$INSTANCE_NAME")
+  local reg_file="${REGISTRY_DIR}/${INSTANCE_NAME}.json"
+  local current_remote_port="$remote_port_start"
+
+  # Clean up registration on exit
+  trap 'cleanup_registration "$reg_file"; exit 0' TERM EXIT
+
+  while true; do
+    # Register on relay (lazily creates directory)
+    register_instance "$current_remote_port" "$local_port" "$reg_file"
+
+    # Try to establish tunnel
+    ${RELAY_SSH_CMD} -N \
+      -o ConnectTimeout=10 \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -o ExitOnForwardFailure=yes \
+      -R "${current_remote_port}:localhost:${local_port}" 2>/dev/null
+
+    local exit_code=$?
+
+    # Check if parent (opencode) is still alive
+    if ! kill -0 "$PPID" 2>/dev/null; then
+      break
+    fi
+
+    if (( exit_code == 255 )); then
+      # SSH error — could be port conflict or connection failure
+      # Try next port
+      current_remote_port=$(( REMOTE_PORT_BASE + (current_remote_port - REMOTE_PORT_BASE + 1) % REMOTE_PORT_RANGE ))
+    fi
+
+    sleep 5
+  done
 }
 
 # ── Main ─────────────────────────────────────────────────────────
@@ -149,7 +149,7 @@ REG_FILE="${REGISTRY_DIR}/${INSTANCE_NAME}.json"
 
 TUNNEL_PID=""
 
-if [ -n "$RELAY_HOST" ]; then
+if [ -n "$RELAY_SSH_CMD" ]; then
   tunnel_loop "$LOCAL_PORT" &
   TUNNEL_PID=$!
 else
@@ -175,8 +175,8 @@ echo "  opencode-connected"
 echo "  Instance:   ${INSTANCE_NAME}"
 echo "  Local port: ${LOCAL_PORT}"
 echo "  Registry:   ${REGISTRY_DIR}"
-if [ -n "$RELAY_HOST" ]; then
-  echo "  Relay:      ${RELAY_USER}@${RELAY_HOST}"
+if [ -n "$RELAY_SSH_CMD" ]; then
+  echo "  Relay:      ${RELAY_SSH_CMD%% *}..."
 else
   echo "  Relay:      (none — local only)"
 fi
@@ -185,6 +185,6 @@ echo "════════════════════════�
 echo ""
 
 # Start opencode with HTTP side-car (foreground TUI)
-# exec replaces this shell — EXIT trap fires when opencode exits
-export OPENCODE_SERVER_PASSWORD
-exec npx -y opencode-ai@latest --port "$LOCAL_PORT" --hostname 0.0.0.0 "$@"
+# Binds to 127.0.0.1 (default) — SSH tunnels reach it via localhost.
+# exec replaces this shell — EXIT trap fires when opencode exits.
+exec npx -y opencode-ai@latest --port "$LOCAL_PORT" "$@"
