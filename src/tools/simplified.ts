@@ -77,23 +77,26 @@ async function getInstanceStatus(
   }
 }
 
+interface SessionInfo {
+  id: string
+  title?: string
+  time: { created: number; updated: number }
+}
+
 /**
- * Get the most recently updated session title for an instance.
+ * Find the most recently updated session on an instance.
+ * Returns the session ID and title.
  */
-async function getRecentSessionTitle(
+async function findMostRecentSession(
   baseUrl: string,
-): Promise<string | undefined> {
+): Promise<SessionInfo | undefined> {
   try {
     const res = await fetch(`${baseUrl}/session`)
     if (!res.ok) return undefined
-    const sessions = (await res.json()) as Array<{
-      id: string
-      title?: string
-      time: { updated: number }
-    }>
+    const sessions = (await res.json()) as SessionInfo[]
     if (sessions.length === 0) return undefined
     sessions.sort((a, b) => b.time.updated - a.time.updated)
-    return sessions[0].title
+    return sessions[0]
   } catch {
     return undefined
   }
@@ -140,9 +143,13 @@ export function registerSimplifiedTools(
             .filter((inst) => inst.online)
             .map(async (inst) => {
               const { busySessionId } = await getInstanceStatus(inst.url)
-              const recentSession = await getRecentSessionTitle(inst.url)
+              const session = await findMostRecentSession(inst.url)
               const status = busySessionId ? 'busy' : 'idle'
-              return { instance: inst, status, recentSession }
+              return {
+                instance: inst,
+                status,
+                recentSession: session?.title,
+              }
             }),
         )
 
@@ -164,7 +171,7 @@ export function registerSimplifiedTools(
 
   server.tool(
     'send',
-    'Send a message to the currently focused opencode session on an instance. Streams the response back in real-time. Set abort=true to stop a running task instead of sending a message.',
+    'Send a message to the most recent opencode session on an instance. Streams the response back in real-time. The TUI on the remote machine updates live. Set abort=true to stop a running task instead of sending a message.',
     {
       message: z
         .string()
@@ -238,17 +245,27 @@ export function registerSimplifiedTools(
           }
         }
 
-        // Submit via TUI endpoints (targets the focused session)
-        await fetch(`${baseUrl}/tui/append-prompt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: message }),
-        })
+        // Find the most recently updated session
+        const session = await findMostRecentSession(baseUrl)
+        if (!session) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `No sessions found on ${instance.name}. Open opencode and start a session first.`,
+              },
+            ],
+            isError: true,
+          }
+        }
 
-        await fetch(`${baseUrl}/tui/submit-prompt`, {
+        // Submit via session API (TUI updates in real-time)
+        await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
+          body: JSON.stringify({
+            parts: [{ type: 'text', text: message }],
+          }),
         })
 
         // Subscribe to SSE and stream deltas back
@@ -257,7 +274,6 @@ export function registerSimplifiedTools(
         const timer = setTimeout(() => controller.abort(), timeout)
 
         let fullResponse = ''
-        let targetSessionId: string | undefined
 
         try {
           for await (const event of sseEvents(
@@ -266,18 +282,10 @@ export function registerSimplifiedTools(
           )) {
             if (
               event.type === 'message.part.delta' &&
-              event.properties.field === 'text'
+              event.properties.field === 'text' &&
+              event.properties.sessionID === session.id
             ) {
               const delta = event.properties.delta as string
-              const sessionId = event.properties.sessionID as string
-
-              // Track which session we're listening to
-              if (!targetSessionId) {
-                targetSessionId = sessionId
-              }
-              // Only accumulate events from our target session
-              if (sessionId !== targetSessionId) continue
-
               fullResponse += delta
 
               // Stream delta back to MCP client via progress notification
@@ -294,19 +302,17 @@ export function registerSimplifiedTools(
               }
             }
 
-            if (event.type === 'session.idle') {
-              const idleSessionId = event.properties.sessionID as string
-              if (
-                targetSessionId &&
-                idleSessionId === targetSessionId
-              ) {
-                break
-              }
+            if (
+              event.type === 'session.idle' &&
+              event.properties.sessionID === session.id
+            ) {
+              break
             }
           }
         } catch (err) {
           if ((err as Error).name === 'AbortError') {
-            fullResponse += '\n\n(still processing — timed out waiting for response)'
+            fullResponse +=
+              '\n\n(still processing — timed out waiting for response)'
           } else {
             throw err
           }
@@ -333,6 +339,128 @@ export function registerSimplifiedTools(
               text: fullResponse,
             },
           ],
+        }
+      } catch (err) {
+        return {
+          content: [
+            { type: 'text', text: `Error: ${(err as Error).message}` },
+          ],
+          isError: true,
+        }
+      }
+    },
+  )
+
+  server.tool(
+    'read',
+    'Read the last few messages from the most recent opencode session on an instance. Use this to see what has been happening without sending a new message.',
+    {
+      instance: z
+        .string()
+        .describe('Instance name (exact or fuzzy substring match)'),
+      message_limit: z
+        .number()
+        .optional()
+        .default(10)
+        .describe(
+          'Max number of messages to retrieve (default 10)',
+        ),
+    },
+    async ({ instance: query, message_limit }) => {
+      try {
+        const { instance } = registry.resolveInstance(query)
+        const baseUrl = instance.url
+
+        // Find the most recently updated session
+        const session = await findMostRecentSession(baseUrl)
+        if (!session) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `No sessions found on ${instance.name}.`,
+              },
+            ],
+          }
+        }
+
+        // Fetch recent messages
+        const msgRes = await fetch(
+          `${baseUrl}/session/${session.id}/message?limit=${message_limit}`,
+        )
+        if (!msgRes.ok) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Failed to fetch messages from ${instance.name}.`,
+              },
+            ],
+            isError: true,
+          }
+        }
+
+        const messages = (await msgRes.json()) as Array<{
+          info: {
+            role: string
+            time: { created: number }
+          }
+          parts: Array<{
+            type: string
+            text?: string
+            tool?: string
+            state?: { status: string }
+          }>
+        }>
+
+        if (messages.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Session "${session.title ?? '(untitled)'}" on ${instance.name} has no messages.`,
+              },
+            ],
+          }
+        }
+
+        // Check status
+        const { busySessionId } = await getInstanceStatus(baseUrl)
+        const status =
+          busySessionId === session.id ? 'busy' : 'idle'
+
+        const lines = [
+          `**${instance.name}** — "${session.title ?? '(untitled)'}" (${status})`,
+          '',
+        ]
+
+        for (const msg of messages) {
+          const role =
+            msg.info.role === 'user' ? 'User' : 'Assistant'
+          const time = new Date(
+            msg.info.time.created,
+          ).toLocaleTimeString()
+
+          const textParts = msg.parts
+            .filter((p) => p.type === 'text' && p.text)
+            .map((p) => p.text!)
+            .join('\n')
+
+          const toolParts = msg.parts
+            .filter((p) => p.type === 'tool')
+            .map(
+              (p) =>
+                `  [tool: ${p.tool} → ${p.state?.status ?? '?'}]`,
+            )
+
+          lines.push(`**${role}** (${time}):`)
+          if (textParts) lines.push(textParts)
+          if (toolParts.length > 0) lines.push(toolParts.join('\n'))
+          lines.push('')
+        }
+
+        return {
+          content: [{ type: 'text', text: lines.join('\n') }],
         }
       } catch (err) {
         return {
