@@ -1,6 +1,6 @@
 {
   "name": "@klutometis/opencode-mcp",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "MCP server for orchestrating OpenCode instances across machines via SSH reverse tunnels",
   "type": "module",
   "main": "dist/index.js",
@@ -35,6 +35,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@opencode-ai/sdk": "^1.2.26",
+    "opencode-ai": "*",
     "zod": "^3.0.0"
   },
   "devDependencies": {

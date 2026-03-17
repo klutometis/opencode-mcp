@@ -187,4 +187,4 @@ echo ""
 # Start opencode with HTTP side-car (foreground TUI)
 # Binds to 127.0.0.1 (default) — SSH tunnels reach it via localhost.
 # exec replaces this shell — EXIT trap fires when opencode exits.
-exec npx -y opencode-ai@latest --port "$LOCAL_PORT" "$@"
+exec opencode --port "$LOCAL_PORT" "$@"
