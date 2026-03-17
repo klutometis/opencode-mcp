@@ -10,31 +10,43 @@ For the primary use case ("I'm out and about, want to talk to my opencode"),
 they're too much ceremony. The user doesn't care about sessions — they just
 want to talk to whatever's on screen.
 
-## Design: Two (maybe three) simplified tools
+## Design: Two tools
 
 ### `instances` — what's connected?
 
 - **Args**: none
-- **Behavior**: refresh + list all connected instances
-- **Returns**: instance names, hostnames, CWDs, versions, online status
+- **Behavior**: refresh + list all connected instances + check `/session/status`
+  per instance to report busy/idle state
+- **Returns**: instance names, hostnames, CWDs, versions, online status,
+  and current activity state (busy/idle). If busy, includes which session
+  is actively processing.
+- **Use case**: "I just opened the chat app, what's going on?" — one call
+  gives you the full picture without needing to drill into sessions.
 
 ### `send` — talk to opencode
 
-- **Args**: `message` (required), `instance` (required)
-- **Behavior**:
-  1. `POST /tui/append-prompt {text: message}` — stages the message
-  2. `POST /tui/submit-prompt` — fires it to the TUI's focused session
-  3. `GET /event` (SSE stream) — subscribe to opencode events
-  4. For each SSE event:
+- **Args**: `message` (required), `instance` (required), `abort` (optional bool)
+- **Normal behavior** (`abort` unset or false):
+  1. Check `/session/status` — if a session is already busy, return a
+     message saying the instance is busy (let the user/LLM decide whether
+     to wait or abort)
+  2. `POST /tui/append-prompt {text: message}` — stages the message
+  3. `POST /tui/submit-prompt` — fires it to the TUI's focused session
+  4. `GET /event` (SSE stream) — subscribe to opencode events
+  5. For each SSE event:
      - If `message.part.delta` with `field === "text"`:
        → send `notifications/progress` to MCP client with the delta text
        → accumulate delta into fullResponse
      - If `session.idle`:
        → close SSE connection
        → return complete accumulated response as tool result
-  5. On timeout (configurable, default 300s):
+  6. On timeout (configurable, default 300s):
      → close SSE connection
      → return what we have + "(still processing)"
+- **Abort behavior** (`abort: true`):
+  1. Check `/session/status` — find the busy session
+  2. `POST /session/:id/abort` on the busy session
+  3. Return confirmation that the session was aborted
 - **Streaming**: deltas stream back to the MCP client in real-time via
   `notifications/progress`. The MCP SDK supports this over stdio — tool
   handlers can call `extra.sendNotification()` while still executing.
@@ -48,17 +60,6 @@ want to talk to whatever's on screen.
 - **Session ID discovery**: we don't need to know the session ID in advance.
   After submitting via TUI, the first `message.part.delta` SSE event tells
   us which session it went to (events include `sessionID`).
-
-### `stop` — abort a runaway task (TBD)
-
-- **Args**: `instance` (required)
-- **Behavior**: find the active (non-idle) session, call
-  `POST /session/:id/abort`
-- **Open question**: is this needed as a separate tool, or can the `send`
-  tool handle timeouts gracefully enough? If `send` returns "(still
-  processing)" on timeout, the user could say "stop it" and the LLM would
-  call `stop`. Alternatively, could be built into `send` as a special
-  message like "abort" or "stop".
 
 ## Why TUI endpoints instead of session API
 
@@ -130,17 +131,16 @@ tools remain in the MCP server but are hidden by the gateway's tool transform.
     "tools": {
         "instances": ToolTransformConfig(...),
         "send": ToolTransformConfig(...),
-        # "stop": ToolTransformConfig(...),  # TBD
     },
 },
 ```
 
 Anyone using `@klutometis/opencode-mcp` directly (not through the gateway)
-gets all 10+ tools.
+gets all 10 tools (8 power + 2 simplified).
 
 ## Implementation order
 
-1. `src/tools/simplified.ts` — `instances` + `send` (+ maybe `stop`)
+1. `src/tools/simplified.ts` — `instances` + `send`
 2. Wire into `src/index.ts`
 3. Test via MCP inspector — verify `send` streams deltas back
 4. Update `gateway.py` — expose only simplified tools
@@ -152,7 +152,7 @@ gets all 10+ tools.
 
 | Repo | File | Change |
 |------|------|--------|
-| `opencode-mcp` | `src/tools/simplified.ts` (new) | `instances`, `send`, maybe `stop` |
+| `opencode-mcp` | `src/tools/simplified.ts` (new) | `instances` + `send` |
 | `opencode-mcp` | `src/index.ts` | Register simplified tools |
 | `opencode-mcp` | `package.json` | Bump version |
 | `mcp-gateway` | `gateway.py` | Expose only simplified tools |
