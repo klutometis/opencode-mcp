@@ -1,14 +1,16 @@
 {
   "name": "@klutometis/opencode-mcp",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "MCP server for orchestrating OpenCode instances across machines via SSH reverse tunnels",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "opencode-mcp": "dist/index.js"
+    "opencode-mcp": "dist/index.js",
+    "opencode-connected": "scripts/opencode-connected"
   },
   "files": [
     "dist",
+    "scripts",
     "README.md"
   ],
   "scripts": {
