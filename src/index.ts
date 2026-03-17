@@ -6,6 +6,7 @@ import { InstanceRegistry } from './registry.js'
 import { registerInstanceTools } from './tools/instances.js'
 import { registerSessionTools } from './tools/sessions.js'
 import { registerMessageTools } from './tools/messages.js'
+import { registerSimplifiedTools } from './tools/simplified.js'
 import type { Transport } from './transport/interface.js'
 
 function createTransport(): Transport {
@@ -40,6 +41,7 @@ async function main() {
   registerInstanceTools(server, registry)
   registerSessionTools(server, registry)
   registerMessageTools(server, registry)
+  registerSimplifiedTools(server, registry)
 
   // Connect via stdio (for mcp-gateway or direct use)
   const stdioTransport = new StdioServerTransport()

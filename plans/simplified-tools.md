@@ -106,6 +106,59 @@ opencode instance (on your laptop)
 Every link in this chain streams. The MCP progress notifications carry the
 opencode deltas from the bottom of the chain to the top.
 
+## Open question: status visibility
+
+When the user opens the chat frontend (e.g., after a session interruption
+or just checking in), they need to know what's going on. Three options for
+how to surface instance status:
+
+### Option A: Bake status into `instances`
+
+When listing instances, also check `GET /session/status` per instance and
+report whether each instance is busy or idle, and which session is active.
+One tool call gives the full picture:
+
+```
+danenberg2-bin: online (busy — "Image paste over SSH+tmux troubleshooting")
+danenberg2-roblox: online (idle)
+```
+
+Pro: one tool call, complete picture. The LLM can proactively call this
+when the user says "what's happening?" and immediately knows the state.
+
+Con: slightly heavier than a pure discovery call (extra HTTP request per
+instance to check status).
+
+### Option B: Separate `status` tool
+
+A lightweight tool that just returns busy/idle per instance. Keeps
+`instances` focused on discovery.
+
+Pro: clean separation of concerns.
+
+Con: third tool, which we're trying to avoid. The LLM would need to call
+`instances` then `status` to get the full picture.
+
+### Option C: Status check built into `send`
+
+Before submitting, `send` checks if the instance is busy. If busy, it
+returns a message like "Instance is busy processing. Say 'wait' to check
+back or 'stop' to abort." instead of clobbering the running task.
+
+Pro: no extra tool, natural flow — you try to send, it tells you if
+something's already running.
+
+Con: you only learn about the busy state when you try to send, not
+proactively.
+
+### Current recommendation: A + C
+
+- `instances` shows busy/idle state (proactive visibility)
+- `send` checks status before submitting (defensive, prevents clobbering)
+
+This keeps us at two tools while covering both the "what's happening?"
+and "let me talk to it" use cases.
+
 ## Open question: llm-multiplex rendering
 
 For the user to see streaming opencode responses in the chat UI, llm-multiplex
