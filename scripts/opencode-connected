@@ -110,8 +110,8 @@ tunnel_loop() {
   local reg_file="${REGISTRY_DIR}/${INSTANCE_NAME}.json"
   local current_remote_port="$remote_port_start"
 
-  # Clean up registration on exit
-  trap 'cleanup_registration "$reg_file"; exit 0' TERM EXIT
+  # Clean up registration on exit (capture value since local var)
+  trap "cleanup_registration '${REGISTRY_DIR}/${INSTANCE_NAME}.json'; exit 0" TERM EXIT
 
   while true; do
     # Register on relay (lazily creates directory)
