@@ -259,6 +259,13 @@ export function registerSimplifiedTools(
           }
         }
 
+        // TODO: If multiple send calls race past the busy check simultaneously,
+        // they'll all subscribe to the same SSE stream filtered by sessionID.
+        // Each would see all deltas, not just "their" response. Fix by filtering
+        // SSE events by messageID instead of sessionID — after prompt_async,
+        // fetch the latest message to get our messageID. Low priority since the
+        // typical use case is one user, one model, one send at a time.
+
         // Submit via session API (TUI updates in real-time)
         await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
           method: 'POST',
