@@ -6,31 +6,38 @@ set -euo pipefail
 # to a relay machine for remote access via opencode-mcp.
 #
 # Usage:
-#   opencode-connected                     # TUI + server, local only
-#   opencode-connected -- -d               # pass -d (debug) to opencode
+#   opencode-connected                     # TUI + server + tunnel
+#   opencode-connected -- -d               # pass extra flags to opencode
+#   opencode-connected status              # show tunnel state
+#   opencode-connected cleanup             # kill stale tunnels + registrations
+#   opencode-connected sessions            # list sessions on registered instances
 #
-# With relay (set in shell profile or .env):
-#   export RELAY_SSH_CMD="gcloud compute ssh mcp-gateway --zone=us-central1-a --project=my-project --"
-#   export RELAY_SSH_CMD="ssh user@relay.example.com"
-#   opencode-connected
+# Multiple instances in the same directory will compete for the same
+# registration. Set INSTANCE_NAME to disambiguate:
+#   INSTANCE_NAME=my-tests opencode-connected
+#   INSTANCE_NAME=my-refactor opencode-connected
 #
-# Symlink:
-#   ln -s ~/prg/opencode-mcp/scripts/opencode-connected ~/bin/opencode-connected
-#
-# Config selection (e.g. work MCPs) is handled extrinsically:
-#   export OPENCODE_CONFIG=~/.config/opencode/opencode-work.jsonc
+# Logs: /tmp/opencode-connected.log
 # ─────────────────────────────────────────────────────────────────
 
 # ── Config ───────────────────────────────────────────────────────
 RELAY_SSH_CMD="${RELAY_SSH_CMD:-}"
 INSTANCE_NAME="${INSTANCE_NAME:-$(hostname)-$(basename "$PWD")}"
 REGISTRY_DIR="${RELAY_REGISTRY_DIR:-/tmp/opencode-relay}"
+LOGFILE="/tmp/opencode-connected.log"
 
 # Port ranges
 LOCAL_PORT_MIN=4096
 LOCAL_PORT_MAX=5095
 REMOTE_PORT_BASE=10000
 REMOTE_PORT_RANGE=1000
+
+# ── Logging ──────────────────────────────────────────────────────
+log() {
+  local ts
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$ts] $*" >> "$LOGFILE"
+}
 
 # ── Find a random available local port ───────────────────────────
 find_local_port() {
@@ -47,16 +54,28 @@ find_local_port() {
     (( attempts++ ))
   done
 
-  echo "ERROR: Could not find an available local port after ${max_attempts} attempts" >&2
+  log "ERROR: Could not find an available local port after ${max_attempts} attempts"
   return 1
 }
 
-# ── Compute stable remote port from instance name ────────────────
-compute_remote_port() {
-  local name="$1"
-  local hash
-  hash=$(echo -n "$name" | cksum | cut -d' ' -f1)
-  echo $(( REMOTE_PORT_BASE + hash % REMOTE_PORT_RANGE ))
+# ── Find a random available remote port (one SSH call) ───────────
+find_remote_port() {
+  # Get all used ports in our range in one SSH call
+  local used=""
+  used=$(${RELAY_SSH_CMD} "ss -tln 2>/dev/null | grep -oP ':1[0-9]{4}\b' | tr -d ':'" 2>/dev/null) || true
+
+  local attempts=0
+  while (( attempts < 50 )); do
+    local candidate=$(( REMOTE_PORT_BASE + RANDOM % REMOTE_PORT_RANGE ))
+    if [ -z "$used" ] || ! echo "$used" | grep -q "^${candidate}$"; then
+      echo "$candidate"
+      return 0
+    fi
+    (( attempts++ ))
+  done
+
+  # Fallback: just pick one and let SSH fail (retry loop handles it)
+  echo $(( REMOTE_PORT_BASE + RANDOM % REMOTE_PORT_RANGE ))
 }
 
 # ── Registration helpers ─────────────────────────────────────────
@@ -86,86 +105,368 @@ register_instance() {
   reg_json=$(make_reg_json "$port" "$local_port")
 
   if [ -n "$RELAY_SSH_CMD" ]; then
-    ${RELAY_SSH_CMD} "mkdir -p '${REGISTRY_DIR}' && cat > '${reg_file}'" <<< "$reg_json" 2>/dev/null || true
+    log "Registering: port=${port} localPort=${local_port}"
+    if ${RELAY_SSH_CMD} "cat > '${reg_file}'" <<< "$reg_json" 2>>"$LOGFILE"; then
+      log "Registration OK"
+    else
+      log "Registration failed (exit $?)"
+    fi
   else
     mkdir -p "$REGISTRY_DIR"
     echo "$reg_json" > "$reg_file"
+    log "Registered locally: ${reg_file}"
   fi
 }
 
 cleanup_registration() {
   local reg_file="$1"
   if [ -n "$RELAY_SSH_CMD" ]; then
-    ${RELAY_SSH_CMD} "rm -f '${reg_file}'" 2>/dev/null || true
+    log "Cleaning up registration: ${reg_file}"
+    ${RELAY_SSH_CMD} "rm -f '${reg_file}'" 2>>"$LOGFILE" || true
   else
     rm -f "$reg_file" 2>/dev/null || true
+    log "Cleaned up local registration: ${reg_file}"
   fi
 }
 
-# ── Tunnel management (runs in background) ───────────────────────
-tunnel_loop() {
-  local local_port="$1"
-  local remote_port_start
-  remote_port_start=$(compute_remote_port "$INSTANCE_NAME")
-  local reg_file="${REGISTRY_DIR}/${INSTANCE_NAME}.json"
-  local current_remote_port="$remote_port_start"
-
-  # Clean up registration on exit (capture value since local var)
-  trap "cleanup_registration '${REGISTRY_DIR}/${INSTANCE_NAME}.json'; exit 0" TERM EXIT
+# ── Health probe (runs alongside tunnel) ─────────────────────────
+# Also re-registers on each successful probe to keep the registration
+# file in sync with the actual tunnel port (heartbeat).
+health_probe_loop() {
+  local remote_port="$1"
+  local ssh_pid="$2"
+  local local_port="$3"
+  local reg_file="$4"
 
   while true; do
-    # Register on relay (lazily creates directory)
+    sleep 60
+
+    # If the SSH process is already dead, stop probing
+    if ! kill -0 "$ssh_pid" 2>/dev/null; then
+      break
+    fi
+
+    # Probe opencode through the tunnel from the relay
+    if ${RELAY_SSH_CMD} "curl -sf --max-time 10 http://localhost:${remote_port}/global/health" >>"$LOGFILE" 2>&1; then
+      log "Health probe OK (port ${remote_port})"
+      # Re-register to keep the file in sync and act as heartbeat
+      register_instance "$remote_port" "$local_port" "$reg_file"
+    else
+      log "Health probe FAILED (port ${remote_port}) — killing tunnel to force reconnect"
+      kill "$ssh_pid" 2>/dev/null
+      break
+    fi
+  done
+}
+
+# ── Tunnel management (runs in background) ───────────────────────
+# This loop NEVER exits except when:
+#   - Parent process (opencode TUI) dies
+#   - SIGTERM is received (from parent's cleanup trap)
+# Everything else — SSH failure, port conflict, network drop — results in retry.
+tunnel_loop() {
+  local local_port="$1"
+  local reg_file="${REGISTRY_DIR}/${INSTANCE_NAME}.json"
+  local backoff=5
+  local health_pid=""
+
+  # Cleanup ONLY on SIGTERM (parent says "die"). Never on EXIT.
+  trap '
+    log "Tunnel loop received SIGTERM — cleaning up"
+    [ -n "${health_pid:-}" ] && kill "${health_pid}" 2>/dev/null
+    cleanup_registration "'"${reg_file}"'"
+    exit 0
+  ' TERM
+
+  while true; do
+    # Pick a random available remote port (one SSH call to scan)
+    local current_remote_port
+    current_remote_port=$(find_remote_port) || current_remote_port=$(( REMOTE_PORT_BASE + RANDOM % REMOTE_PORT_RANGE ))
+
+    # Register on relay
     register_instance "$current_remote_port" "$local_port" "$reg_file"
 
-    # Try to establish tunnel
+    # Open tunnel in background so health probe can run alongside
+    log "Opening SSH tunnel: remote=${current_remote_port} -> local=${local_port} (backoff=${backoff}s)"
+    local tunnel_start
+    tunnel_start=$(date +%s)
+    local exit_code=0
+
     ${RELAY_SSH_CMD} -N \
       -o ConnectTimeout=10 \
       -o ServerAliveInterval=30 \
       -o ServerAliveCountMax=3 \
       -o ExitOnForwardFailure=yes \
-      -R "${current_remote_port}:localhost:${local_port}" 2>/dev/null
+      -R "${current_remote_port}:localhost:${local_port}" 2>>"$LOGFILE" &
+    local ssh_pid=$!
 
-    local exit_code=$?
+    # Start health probe alongside the tunnel (also re-registers as heartbeat)
+    health_probe_loop "$current_remote_port" "$ssh_pid" "$local_port" "$reg_file" &
+    health_pid=$!
 
-    # Check if parent (opencode) is still alive
+    # Wait for SSH to die (tunnel drop, health probe kill, whatever)
+    wait "$ssh_pid" 2>/dev/null || exit_code=$?
+
+    # Stop health probe
+    kill "$health_pid" 2>/dev/null || true
+    wait "$health_pid" 2>/dev/null || true
+    health_pid=""
+
+    local tunnel_elapsed=$(( $(date +%s) - tunnel_start ))
+    log "Tunnel exited: code=${exit_code} uptime=${tunnel_elapsed}s"
+
+    # THE ONLY EXIT CONDITION: parent (opencode TUI) is dead
     if ! kill -0 "$PPID" 2>/dev/null; then
+      log "Parent process gone — exiting tunnel loop"
+      cleanup_registration "$reg_file"
       break
     fi
 
-    if (( exit_code == 255 )); then
-      # SSH error — could be port conflict or connection failure
-      # Try next port
-      current_remote_port=$(( REMOTE_PORT_BASE + (current_remote_port - REMOTE_PORT_BASE + 1) % REMOTE_PORT_RANGE ))
+    # Adjust backoff
+    if (( tunnel_elapsed > 30 )); then
+      backoff=5
+      log "Tunnel was stable (${tunnel_elapsed}s), reset backoff"
+    else
+      backoff=$(( backoff * 2 ))
+      (( backoff > 60 )) && backoff=60
+      log "Rapid failure (${tunnel_elapsed}s), backoff=${backoff}s"
     fi
 
-    sleep 5
+    # Jitter to avoid thundering herd
+    local jitter=$(( RANDOM % 5 ))
+    log "Retrying in $(( backoff + jitter ))s..."
+    sleep $(( backoff + jitter ))
+
+    # ALWAYS RETRY. NEVER EXIT. NEVER CLEANUP.
   done
 }
 
+# ── Subcommands ──────────────────────────────────────────────────
+
+cmd_status() {
+  echo "Instance:   ${INSTANCE_NAME}"
+  echo "Registry:   ${REGISTRY_DIR}"
+  echo "Log:        ${LOGFILE}"
+  echo ""
+
+  # Check for running tunnel processes
+  local pids
+  pids=$(pgrep -f "opencode-connected" 2>/dev/null | grep -v "^$$\$" || true)
+  if [ -n "$pids" ]; then
+    echo "Running tunnel processes:"
+    for pid in $pids; do
+      local cmd
+      cmd=$(ps -p "$pid" -o args= 2>/dev/null || echo "(dead)")
+      echo "  PID ${pid}: ${cmd}"
+    done
+  else
+    echo "No running tunnel processes."
+  fi
+  echo ""
+
+  # Check registration on relay
+  if [ -n "$RELAY_SSH_CMD" ]; then
+    echo "Relay registration:"
+    ${RELAY_SSH_CMD} "cat '${REGISTRY_DIR}/${INSTANCE_NAME}.json' 2>/dev/null || echo '  (none)'" 2>/dev/null
+    echo ""
+
+    echo "All registrations on relay:"
+    ${RELAY_SSH_CMD} "ls '${REGISTRY_DIR}/' 2>/dev/null || echo '  (none)'" 2>/dev/null
+    echo ""
+
+    echo "Active tunnel ports on relay:"
+    ${RELAY_SSH_CMD} "ss -tln 2>/dev/null | grep -E ':1[0-9]{4} ' || echo '  (none)'" 2>/dev/null
+    echo ""
+
+    # Health check each registered instance through the tunnel
+    echo "Health checks:"
+    local reg_data
+    reg_data=$(${RELAY_SSH_CMD} "cat ${REGISTRY_DIR}/*.json 2>/dev/null" 2>/dev/null) || true
+    if [ -n "$reg_data" ]; then
+      local instances
+      instances=$(echo "$reg_data" | python3 -c "
+import json, sys
+text = sys.stdin.read()
+decoder = json.JSONDecoder()
+idx = 0
+while idx < len(text):
+    while idx < len(text) and text[idx] in ' \t\n\r':
+        idx += 1
+    if idx >= len(text):
+        break
+    try:
+        reg, length = decoder.raw_decode(text, idx)
+        idx += length
+        print(f'{reg.get(\"name\", \"?\")}\t{reg.get(\"port\", 0)}')
+    except json.JSONDecodeError:
+        break
+" 2>/dev/null) || true
+
+      # Batch all health checks into one SSH call
+      if [ -n "$instances" ]; then
+        local ports_cmd=""
+        while IFS=$'\t' read -r name port; do
+          ports_cmd="${ports_cmd}echo -n '  ${name} (port ${port}): '; curl -sf --max-time 5 http://localhost:${port}/global/health && echo '' || echo 'UNREACHABLE'; "
+        done <<< "$instances"
+        ${RELAY_SSH_CMD} "${ports_cmd}" 2>/dev/null || echo "  (failed to reach relay)"
+      fi
+    else
+      echo "  (no registrations)"
+    fi
+  else
+    echo "Local registration:"
+    cat "${REGISTRY_DIR}/${INSTANCE_NAME}.json" 2>/dev/null || echo "  (none)"
+  fi
+  echo ""
+
+  echo "Recent log entries:"
+  tail -10 "$LOGFILE" 2>/dev/null || echo "  (no log)"
+}
+
+cmd_cleanup() {
+  echo "Cleaning up..."
+
+  # Kill local tunnel loop processes (not the current one)
+  local pids
+  pids=$(pgrep -f "opencode-connected" 2>/dev/null | grep -v "^$$\$" || true)
+  for pid in $pids; do
+    local cmd
+    cmd=$(ps -p "$pid" -o args= 2>/dev/null || echo "")
+    if echo "$cmd" | grep -q "tunnel_loop\|scripts/opencode-connected"; then
+      echo "  Killing local PID ${pid}"
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+
+  # Clean up relay
+  if [ -n "$RELAY_SSH_CMD" ]; then
+    echo "  Removing registrations on relay..."
+    ${RELAY_SSH_CMD} "rm -f '${REGISTRY_DIR}'/*.json 2>/dev/null" 2>/dev/null || true
+
+    echo "  Killing stale SSH tunnels on relay..."
+    ${RELAY_SSH_CMD} "
+      for pid in \$(sudo ss -tlnp 2>/dev/null | grep -E ':1[0-9]{4} ' | grep -oP 'pid=\K[0-9]+' | sort -u); do
+        echo \"    Killing relay sshd PID \$pid\"
+        sudo kill \"\$pid\" 2>/dev/null || true
+      done
+    " 2>/dev/null || true
+  else
+    echo "  Removing local registrations..."
+    rm -f "${REGISTRY_DIR}"/*.json 2>/dev/null || true
+  fi
+
+  echo "Done."
+}
+
+cmd_sessions() {
+  # Fetch registrations (remote or local), then probe each instance's
+  # sessions through the relay and format locally.
+  local reg_data=""
+
+  if [ -n "$RELAY_SSH_CMD" ]; then
+    reg_data=$(${RELAY_SSH_CMD} "cat ${REGISTRY_DIR}/*.json 2>/dev/null" 2>/dev/null) || true
+  else
+    reg_data=$(cat "${REGISTRY_DIR}"/*.json 2>/dev/null) || true
+  fi
+
+  if [ -z "$reg_data" ]; then
+    echo "No registered instances."
+    return
+  fi
+
+  # Parse registrations into name:port pairs, then probe each one
+  local instances
+  instances=$(echo "$reg_data" | python3 -c "
+import json, sys
+
+text = sys.stdin.read()
+decoder = json.JSONDecoder()
+idx = 0
+while idx < len(text):
+    while idx < len(text) and text[idx] in ' \t\n\r':
+        idx += 1
+    if idx >= len(text):
+        break
+    try:
+        reg, length = decoder.raw_decode(text, idx)
+        idx += length
+        print(f'{reg.get(\"name\", \"?\")}\t{reg.get(\"port\", 0)}')
+    except json.JSONDecodeError:
+        break
+" 2>/dev/null) || true
+
+  if [ -z "$instances" ]; then
+    echo "No registered instances."
+    return
+  fi
+
+  while IFS=$'\t' read -r name port; do
+    echo "=== ${name} (port ${port}) ==="
+
+    local session_data=""
+    if [ -n "$RELAY_SSH_CMD" ]; then
+      session_data=$(${RELAY_SSH_CMD} "curl -sf --max-time 5 http://localhost:${port}/session" 2>/dev/null) || true
+    else
+      session_data=$(curl -sf --max-time 5 "http://localhost:${port}/session" 2>/dev/null) || true
+    fi
+
+    if [ -n "$session_data" ]; then
+      echo "$session_data" | python3 -c "
+import json, sys
+sessions = json.load(sys.stdin)
+sessions.sort(key=lambda s: s['time']['updated'], reverse=True)
+for s in sessions[:5]:
+    sid = s['id'][:12]
+    title = s.get('title', '(untitled)')[:50]
+    print(f'  {sid}  {title}')
+" 2>/dev/null || echo "  (parse error)"
+    else
+      echo "  (unreachable)"
+    fi
+  done <<< "$instances"
+}
+
+# ── Subcommand dispatch ──────────────────────────────────────────
+case "${1:-}" in
+  status)   cmd_status; exit 0 ;;
+  cleanup)  cmd_cleanup; exit 0 ;;
+  sessions) cmd_sessions; exit 0 ;;
+esac
+
 # ── Main ─────────────────────────────────────────────────────────
+
+# Start fresh log entry
+echo "" >> "$LOGFILE"
+log "=== opencode-connected starting ==="
+log "Instance: ${INSTANCE_NAME}"
+log "Registry: ${REGISTRY_DIR}"
+log "Relay: ${RELAY_SSH_CMD:-none}"
 
 LOCAL_PORT=$(find_local_port)
 REG_FILE="${REGISTRY_DIR}/${INSTANCE_NAME}.json"
+log "Local port: ${LOCAL_PORT}"
 
 TUNNEL_PID=""
 
 if [ -n "$RELAY_SSH_CMD" ]; then
-  tunnel_loop "$LOCAL_PORT" &
+  tunnel_loop "$LOCAL_PORT" >>"$LOGFILE" 2>&1 &
   TUNNEL_PID=$!
+  log "Tunnel loop started (PID ${TUNNEL_PID})"
 else
   # Local only: register directly (port field = local port since no tunnel)
   register_instance "$LOCAL_PORT" "$LOCAL_PORT" "$REG_FILE"
 fi
 
-# Clean up on exit
+# Clean up on exit — sends SIGTERM to tunnel_loop which does its own cleanup
 cleanup() {
+  log "Main process shutting down..."
   if [ -n "$TUNNEL_PID" ]; then
-    kill "$TUNNEL_PID" 2>/dev/null
+    kill "$TUNNEL_PID" 2>/dev/null || true
     wait "$TUNNEL_PID" 2>/dev/null || true
   else
-    # Local only: clean up registration file directly
     cleanup_registration "$REG_FILE"
   fi
+  log "=== opencode-connected stopped ==="
 }
 trap cleanup EXIT INT TERM
 
@@ -181,6 +482,7 @@ else
   echo "  Relay:      (none — local only)"
 fi
 echo "  CWD:        ${PWD}"
+echo "  Log:        ${LOGFILE}"
 echo "═══════════════════════════════════════════════════"
 echo ""
 

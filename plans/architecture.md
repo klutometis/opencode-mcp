@@ -336,11 +336,27 @@ to maintain persistent SSE connections per instance.
 - **Cloudflare Tunnel transport**: `cloudflared` on each machine, automatic
   HTTPS/subdomains, no self-hosted relay
 
+### SSH tunnel resilience: autossh upgrade path
+
+The current `tunnel_loop` in `opencode-connected` is a simple `while true`
++ `sleep 5` reconnect loop with `ServerAliveInterval=30` /
+`ServerAliveCountMax=3` for dead-connection detection (~90s detection).
+
+If we hit edge cases (TCP half-open connections, zombie SSH processes,
+tunnels that appear alive but aren't forwarding), consider replacing the
+loop with `autossh` (https://github.com/Autossh/autossh), which adds:
+- Dedicated monitoring port for proactive dead-tunnel detection
+- Better backoff strategies
+- Battle-tested handling of partial connection states
+
+Our loop also lacks exponential backoff (fixed 5s retry) — could add if
+rapid retries become a problem.
+
 ### Other future work
 
 - **spawn_instance tool**: start a new opencode session on a remote machine
   via SSH + tmux
-- **systemd/launchd service**: make opencode-connect.sh a system service that
+- **systemd/launchd service**: make opencode-connected a system service that
   auto-restarts on boot and on failure — for machines that should always be
   reachable
 

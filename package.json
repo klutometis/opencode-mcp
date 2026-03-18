@@ -1,6 +1,6 @@
 {
   "name": "@klutometis/opencode-mcp",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "MCP server for orchestrating OpenCode instances across machines via SSH reverse tunnels",
   "type": "module",
   "main": "dist/index.js",

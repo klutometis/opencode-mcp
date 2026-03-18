@@ -145,6 +145,17 @@ The script:
 Note: `opencode` without `--port` does **not** start an HTTP server.
 The `--port` flag is what enables the HTTP side-car alongside the TUI.
 
+**Multiple instances in the same directory:** The instance name defaults to
+`$(hostname)-$(basename $PWD)`. If you run multiple opencode instances in
+the same directory, they'll compete for the same registration file — the
+last one wins and the others become invisible to the MCP server. To avoid
+this, set `INSTANCE_NAME` explicitly:
+
+```bash
+INSTANCE_NAME=my-tests opencode-connected
+INSTANCE_NAME=my-refactor opencode-connected
+```
+
 For work machines with different MCP configs, set `OPENCODE_CONFIG` in your
 shell profile — the script does not handle config selection.
 
