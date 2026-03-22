@@ -3,9 +3,6 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { LocalRelayTransport } from './transport/local-relay.js'
 import { InstanceRegistry } from './registry.js'
-import { registerInstanceTools } from './tools/instances.js'
-import { registerSessionTools } from './tools/sessions.js'
-import { registerMessageTools } from './tools/messages.js'
 import { registerSimplifiedTools } from './tools/simplified.js'
 import type { Transport } from './transport/interface.js'
 
@@ -37,10 +34,7 @@ async function main() {
     version: '1.0.0',
   })
 
-  // Register all tool groups
-  registerInstanceTools(server, registry)
-  registerSessionTools(server, registry)
-  registerMessageTools(server, registry)
+  // Register tools
   registerSimplifiedTools(server, registry)
 
   // Connect via stdio (for mcp-gateway or direct use)

@@ -62,17 +62,12 @@ boundary. No passwords needed.
 
 | Tool | Input | Description |
 |------|-------|-------------|
-| `list_instances` | — | List all discovered opencode instances |
-| `refresh_instances` | — | Re-scan registry, health-check, return updated list |
-| `list_sessions` | `instance` | List sessions with ID, title, status |
-| `get_session` | `instance`, `session_id`, `message_limit?` | Session details + last N messages |
-| `create_session` | `instance`, `title?` | Create a new chat session |
-| `send_message` | `instance`, `session_id`, `message`, `async?` | Send a prompt (sync or async) |
-| `get_status` | `instance` | Status of all sessions (idle/busy/retry) |
-| `abort_session` | `instance`, `session_id` | Abort a running session |
+| `instances` | — | List all discovered instances with status (idle/busy) and recent session |
+| `send` | `instance`, `message`, `abort?` | Send a message to the most recent session; set `abort=true` to stop a running task |
+| `read` | `instance`, `message_limit?` | Read the last N messages from the most recent session |
 
 Instance names support fuzzy substring matching (e.g. `"laptop"` matches
-`"laptop-myproject"`). Session IDs accept prefixes (e.g. `"ses_3149"`).
+`"laptop-myproject"`).
 
 ## Environment Variables
 
@@ -84,6 +79,7 @@ Instance names support fuzzy substring matching (e.g. `"laptop"` matches
 | `DISCOVERY_INTERVAL_MS` | `30000` | How often to refresh instance list (ms) |
 | `HEALTH_CHECK_TIMEOUT_MS` | `3000` | Timeout for health-checking each instance (ms) |
 | `TRANSPORT` | `local-relay` | Transport backend (`local-relay`, future: `tailscale`) |
+| `SEND_TIMEOUT_MS` | `300000` | Timeout for streaming send responses (ms) |
 
 ### `opencode-connected` script
 
@@ -208,9 +204,9 @@ export RELAY_SSH_CMD="gcloud compute ssh mcp-gateway --zone=us-central1-a --proj
 opencode-connected
 
 # From the chat interface, the LLM can now call:
-# list_instances → sees the connected instance
-# list_sessions → sees its sessions
-# send_message → interacts with it
+# instances → sees the connected instance
+# send → interacts with it
+# read → sees what's been happening
 ```
 
 ## Project Structure
@@ -225,9 +221,7 @@ opencode-mcp/
 │   │   ├── interface.ts         # Abstract Transport interface
 │   │   └── local-relay.ts       # File-based registry + localhost health checks
 │   └── tools/
-│       ├── instances.ts         # list_instances, refresh_instances
-│       ├── sessions.ts          # list_sessions, get_session, create_session
-│       └── messages.ts          # send_message, get_status, abort_session
+│       └── simplified.ts       # instances, send, read
 ├── scripts/
 │   └── opencode-connected       # Client: random port + tunnel + exec opencode TUI
 ├── plans/

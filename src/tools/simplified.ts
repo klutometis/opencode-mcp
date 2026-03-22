@@ -171,7 +171,7 @@ export function registerSimplifiedTools(
 
   server.tool(
     'send',
-    'Send a message to the most recent opencode session on an instance. Streams the response back in real-time. The TUI on the remote machine updates live. Set abort=true to stop a running task instead of sending a message.',
+    'Send a message to the most recent opencode session on an instance. Streams the response back in real-time. Set abort=true to stop a running task instead of sending a message.',
     {
       message: z
         .string()
@@ -259,14 +259,7 @@ export function registerSimplifiedTools(
           }
         }
 
-        // TODO: If multiple send calls race past the busy check simultaneously,
-        // they'll all subscribe to the same SSE stream filtered by sessionID.
-        // Each would see all deltas, not just "their" response. Fix by filtering
-        // SSE events by messageID instead of sessionID — after prompt_async,
-        // fetch the latest message to get our messageID. Low priority since the
-        // typical use case is one user, one model, one send at a time.
-
-        // Submit via session API (TUI updates in real-time)
+        // Submit via session API
         await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
