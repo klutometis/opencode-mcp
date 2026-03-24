@@ -489,4 +489,11 @@ echo ""
 # Start opencode with HTTP side-car (foreground TUI)
 # Binds to 127.0.0.1 (default) — SSH tunnels reach it via localhost.
 # exec replaces this shell — EXIT trap fires when opencode exits.
+#
+# Clear npm_config_package to prevent npx env pollution: when this script
+# is invoked via `npx --package @klutometis/opencode-mcp`, npm leaks
+# npm_config_package into the environment. MCP servers launched by opencode
+# that use npx (e.g. chrome-devtools-mcp) would inherit this and resolve
+# the wrong package.
+unset npm_config_package
 exec opencode --port "$LOCAL_PORT" "$@"
